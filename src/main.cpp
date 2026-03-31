@@ -2,9 +2,9 @@
 #include "driver/pcnt.h"
 
 // ─── 핀 설정 ───
-#define ENC_A_PIN  34  // A상
-#define ENC_B_PIN  35  // B상
-#define ENC_Z_PIN  32  // Z상 (인덱스)
+#define ENC_A_PIN  21  // A상
+#define ENC_B_PIN  22  // B상
+#define ENC_Z_PIN  23  // Z상 (인덱스)
 
 // ─── PCNT 설정 ───
 #define PCNT_UNIT      PCNT_UNIT_0
