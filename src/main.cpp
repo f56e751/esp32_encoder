@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "driver/pcnt.h"
+#include "driver/gpio.h"
 
 // ─── 핀 설정 ───
 #define ENC_A_PIN  21  // A상
@@ -14,21 +15,10 @@
 // ─── 출력 주기 ───
 #define OUTPUT_INTERVAL_MS  50  // 50ms → 20Hz
 
-// 오버플로우 누적용
-volatile long overflow_count = 0;
-
-// PCNT 오버플로우 ISR
-static void IRAM_ATTR pcnt_overflow_isr(void *arg) {
-    uint32_t status = 0;
-    pcnt_get_event_status(PCNT_UNIT, &status);
-
-    if (status & PCNT_EVT_H_LIM) {
-        overflow_count += PCNT_H_LIM;
-    }
-    if (status & PCNT_EVT_L_LIM) {
-        overflow_count += PCNT_L_LIM;
-    }
-}
+// 델타 추적 방식 (ISR 불필요)
+long total_count_accum = 0;
+int16_t prev_raw = 0;
+bool first_read = true;
 
 void pcnt_init() {
     pcnt_config_t config = {};
@@ -57,40 +47,48 @@ void pcnt_init() {
     config.hctrl_mode     = PCNT_MODE_KEEP;
     pcnt_unit_config(&config);
 
-    // 글리치 필터 (1us, 80MHz APB 기준 = 80 클럭)
-    pcnt_set_filter_value(PCNT_UNIT, 80);
+    // 글리치 필터 (5us, 80MHz APB 기준 = 400 클럭)
+    pcnt_set_filter_value(PCNT_UNIT, 400);
     pcnt_filter_enable(PCNT_UNIT);
-
-    // 오버플로우 이벤트 설정
-    pcnt_event_enable(PCNT_UNIT, PCNT_EVT_H_LIM);
-    pcnt_event_enable(PCNT_UNIT, PCNT_EVT_L_LIM);
 
     pcnt_counter_pause(PCNT_UNIT);
     pcnt_counter_clear(PCNT_UNIT);
 
-    // ISR 등록
-    pcnt_isr_service_install(0);
-    pcnt_isr_handler_add(PCNT_UNIT, pcnt_overflow_isr, NULL);
+    // 내부 풀업 활성화 (A상, B상)
+    gpio_pullup_en((gpio_num_t)ENC_A_PIN);
+    gpio_pullup_en((gpio_num_t)ENC_B_PIN);
 
     pcnt_counter_resume(PCNT_UNIT);
 }
 
-// 현재 총 카운트 읽기 (오버플로우 포함)
+// 델타 추적 방식: 50ms마다 호출, 카운터 차이를 누적
 long read_total_count() {
     int16_t raw = 0;
     pcnt_get_counter_value(PCNT_UNIT, &raw);
 
-    long total;
-    noInterrupts();
-    total = overflow_count + raw;
-    interrupts();
-    return total;
+    if (first_read) {
+        first_read = false;
+        prev_raw = raw;
+        return 0;
+    }
+
+    int32_t delta = (int32_t)raw - (int32_t)prev_raw;
+
+    // 카운터가 H_LIM(30000)이나 L_LIM(-30000)에서 0으로 리셋된 경우 보정
+    // 정상 50ms 간 델타는 최대 수천 수준이므로 15000 초과면 리셋 발생
+    if (delta < -15000) {
+        delta += PCNT_H_LIM;   // 정방향 회전 중 H_LIM 리셋
+    } else if (delta > 15000) {
+        delta += PCNT_L_LIM;   // 역방향 회전 중 L_LIM 리셋
+    }
+
+    total_count_accum += delta;
+    prev_raw = raw;
+    return total_count_accum;
 }
 
 void setup() {
     Serial.begin(115200);
-    pinMode(ENC_Z_PIN, INPUT);
-
     pcnt_init();
 
     Serial.println("ENCODER_READY");

@@ -21,8 +21,12 @@ PPR = 5000          # 엔코더 펄스/회전 (Pulse Per Revolution)
 QUAD_MULT = 4       # 4체배 디코딩
 CPR = PPR * QUAD_MULT  # 20000 카운트/회전
 
-# 속도 계산용 이동평균 윈도우
-SPEED_WINDOW = 5
+# 화면 갱신 주기 (초)
+DISPLAY_INTERVAL = 0.5
+# EMA 스무딩 계수 (0~1, 클수록 반응 빠름, 노이즈 많음)
+EMA_ALPHA = 0.1
+# 속도 데드밴드 (이 이하는 0으로 처리, m/s)
+SPEED_DEADBAND = 0.002
 
 
 def find_esp32_port():
@@ -59,21 +63,33 @@ def main():
     roller_diam = args.diameter
     mm_per_pulse = 3.141592653589793 * roller_diam / CPR
 
-    print(f"포트: {port}")
-    print(f"롤러 직경: {roller_diam}mm")
-    print(f"펄스당 이동거리: {mm_per_pulse:.4f}mm")
-    print(f"분해능(CPR): {CPR} counts/rev")
-    print("-" * 60)
-    print(f"{'시간(s)':>8}  {'펄스':>10}  {'거리(mm)':>10}  {'속도(m/s)':>10}")
-    print("-" * 60)
-
-    # 속도 계산용 버퍼: (timestamp_s, distance_mm)
-    history = deque(maxlen=SPEED_WINDOW + 1)
+    # 헤더 (고정 영역)
+    header = (
+        f"\033[1m ESP32 Encoder Receiver\033[0m\n"
+        f" 포트: {port}  |  롤러 직경: {roller_diam}mm  |  "
+        f"분해능: {CPR} CPR  |  펄스당: {mm_per_pulse:.4f}mm\n"
+        f"{'─' * 52}\n"
+    )
 
     try:
         ser = serial.Serial(port, args.baud, timeout=1)
-        time.sleep(2)  # ESP32 리셋 대기
+        # 대기 중 표시
+        sys.stdout.write("\033[2J\033[H")  # 화면 클리어
+        sys.stdout.write(header)
+        sys.stdout.write(" ESP32 리셋 대기 중...")
+        sys.stdout.flush()
+        time.sleep(2)
         ser.reset_input_buffer()
+
+        last_display = 0.0
+        speed_ema = 0.0
+        speed_min = float('inf')
+        speed_max = float('-inf')
+        prev_t = None
+        prev_dist = None
+        t_sec = 0.0
+        total_count = 0
+        distance_mm = 0.0
 
         while True:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
@@ -93,22 +109,68 @@ def main():
             t_sec = esp_time_ms / 1000.0
             distance_mm = total_count * mm_per_pulse
 
-            # 속도 계산 (이동평균)
-            history.append((t_sec, distance_mm))
-            speed_ms = 0.0
-            if len(history) >= 2:
-                dt = history[-1][0] - history[0][0]
-                dd = history[-1][1] - history[0][1]
+            # 매 샘플마다 순간 속도 계산 → EMA 적용
+            if prev_t is not None:
+                dt = t_sec - prev_t
+                dd = distance_mm - prev_dist
                 if dt > 0:
-                    speed_ms = dd / dt / 1000.0  # mm/s → m/s
+                    instant_speed = dd / dt / 1000.0  # mm/s → m/s
+                    speed_ema = EMA_ALPHA * instant_speed + (1 - EMA_ALPHA) * speed_ema
+                    # 데드밴드: 정지 시 노이즈 제거
+                    if abs(speed_ema) < SPEED_DEADBAND:
+                        speed_ema = 0.0
+            prev_t = t_sec
+            prev_dist = distance_mm
 
-            print(f"{t_sec:8.2f}  {total_count:10d}  {distance_mm:10.2f}  {speed_ms:10.4f}")
+            # 화면 갱신 주기
+            now = time.monotonic()
+            if now - last_display < DISPLAY_INTERVAL:
+                continue
+            last_display = now
+
+            speed_ms = speed_ema
+            if prev_t is not None and prev_dist is not None:
+                speed_min = min(speed_min, speed_ms)
+                speed_max = max(speed_max, speed_ms)
+
+            # 방향 표시
+            if speed_ms > 0.0001:
+                direction = ">>>"
+            elif speed_ms < -0.0001:
+                direction = "<<<"
+            else:
+                direction = "---"
+
+            # min/max 표시 (아직 기록 없으면 빈칸)
+            if speed_min == float('inf'):
+                min_str = "       N/A"
+                max_str = "       N/A"
+            else:
+                min_str = f"{speed_min:>10.4f}"
+                max_str = f"{speed_max:>10.4f}"
+
+            # 화면 갱신 (커서를 홈으로 이동 후 덮어쓰기)
+            sys.stdout.write("\033[H")  # 커서 홈
+            sys.stdout.write(header)
+            sys.stdout.write(
+                f"  시간      {t_sec:>10.2f} s\n"
+                f"  펄스      {total_count:>10d}\n"
+                f"  거리      {distance_mm:>10.2f} mm\n"
+                f"{'─' * 52}\n"
+                f"  속도      {speed_ms:>10.4f} m/s  {direction}\n"
+                f"  최소      {min_str} m/s\n"
+                f"  최대      {max_str} m/s\n"
+                f"{'─' * 52}\n"
+                f"  \033[2mCtrl+C 로 종료\033[0m\033[J"
+            )
+            sys.stdout.flush()
 
     except serial.SerialException as e:
-        print(f"시리얼 에러: {e}")
+        print(f"\n시리얼 에러: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n종료")
+        sys.stdout.write("\033[J\n 종료\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
